@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-// Store keeps the messages that passed the filter and the orders made from them, so
-// nothing is lost if the program restarts or your system is down for a while.
+// Store keeps the messages that passed the filter, the events sent to your system, and
+// the confirmations customers were asked for, so nothing is lost if the program
+// restarts or your system is down for a while.
 type Store struct{ db *sql.DB }
 
 const storeSchema = `
@@ -24,12 +27,12 @@ CREATE TABLE IF NOT EXISTS messages (
 	sender_name  TEXT NOT NULL,
 	sent_at      INTEGER NOT NULL,
 	text         TEXT NOT NULL,
-	-- pending, ordered, not_order, skipped or error
+	-- pending, ordered, confirmed, cancelled, not_order, skipped or error
 	status       TEXT NOT NULL DEFAULT 'pending',
 	order_id     TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (chat_id, id)
 );
-CREATE TABLE IF NOT EXISTS orders (
+CREATE TABLE IF NOT EXISTS events (
 	id              TEXT PRIMARY KEY,
 	created_at      INTEGER NOT NULL,
 	payload         TEXT NOT NULL,
@@ -37,6 +40,15 @@ CREATE TABLE IF NOT EXISTS orders (
 	attempts        INTEGER NOT NULL DEFAULT 0,
 	next_attempt_at INTEGER NOT NULL DEFAULT 0,
 	last_error      TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS confirmations (
+	order_id   TEXT PRIMARY KEY,
+	chat_id    TEXT NOT NULL,
+	sender_id  TEXT NOT NULL,
+	order_json TEXT NOT NULL,
+	sent_at    INTEGER NOT NULL,
+	-- waiting, confirmed, changed or cancelled
+	state      TEXT NOT NULL DEFAULT 'waiting'
 );`
 
 func OpenStore(path string) (*Store, error) {
@@ -106,46 +118,89 @@ func (s *Store) MarkMessages(ctx context.Context, batch []Incoming, status, orde
 	return tx.Commit()
 }
 
-type storedOrder struct {
+type storedEvent struct {
 	ID       string
 	Payload  []byte
 	Attempts int
 }
 
-func (s *Store) SaveOrder(ctx context.Context, id string, payload []byte, delivered bool) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO orders (id, created_at, payload, delivered) VALUES (?, ?, ?, ?)`,
+func (s *Store) SaveEvent(ctx context.Context, id string, payload []byte, delivered bool) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO events (id, created_at, payload, delivered) VALUES (?, ?, ?, ?)`,
 		id, time.Now().UnixMilli(), string(payload), delivered)
 	return err
 }
 
-// DueOrders returns orders your system hasn't accepted yet whose next attempt is due.
-func (s *Store) DueOrders(ctx context.Context, now time.Time) ([]storedOrder, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, payload, attempts FROM orders
+// DueEvents returns events your system hasn't accepted yet whose next attempt is due.
+func (s *Store) DueEvents(ctx context.Context, now time.Time) ([]storedEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, payload, attempts FROM events
 		WHERE delivered = 0 AND next_attempt_at <= ? ORDER BY created_at LIMIT 50`, now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []storedOrder
+	var out []storedEvent
 	for rows.Next() {
-		var o storedOrder
+		var e storedEvent
 		var payload string
-		if err := rows.Scan(&o.ID, &payload, &o.Attempts); err != nil {
+		if err := rows.Scan(&e.ID, &payload, &e.Attempts); err != nil {
 			return nil, err
 		}
-		o.Payload = []byte(payload)
-		out = append(out, o)
+		e.Payload = []byte(payload)
+		out = append(out, e)
 	}
 	return out, rows.Err()
 }
 
 func (s *Store) MarkDelivered(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE orders SET delivered = 1, last_error = '' WHERE id = ?`, id)
+	_, err := s.db.ExecContext(ctx, `UPDATE events SET delivered = 1, last_error = '' WHERE id = ?`, id)
 	return err
 }
 
 func (s *Store) MarkAttemptFailed(ctx context.Context, id string, attempts int, next time.Time, reason string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE orders SET attempts = ?, next_attempt_at = ?, last_error = ? WHERE id = ?`,
+	_, err := s.db.ExecContext(ctx, `UPDATE events SET attempts = ?, next_attempt_at = ?, last_error = ? WHERE id = ?`,
 		attempts, next.UnixMilli(), reason, id)
+	return err
+}
+
+// waitingOrder is an order a customer was asked to confirm and hasn't answered yet.
+type waitingOrder struct {
+	ID    string
+	Order Order
+}
+
+// SaveConfirmation records that the customer was asked to confirm an order.
+func (s *Store) SaveConfirmation(ctx context.Context, orderID, chatID, senderID string, order Order) error {
+	orderJSON, err := json.Marshal(order)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT OR REPLACE INTO confirmations (order_id, chat_id, sender_id, order_json, sent_at)
+		VALUES (?, ?, ?, ?, ?)`, orderID, chatID, senderID, string(orderJSON), time.Now().UnixMilli())
+	return err
+}
+
+// WaitingConfirmation returns the latest order this customer was asked to confirm in
+// this chat since the given time and hasn't answered yet, or nil.
+func (s *Store) WaitingConfirmation(ctx context.Context, chatID, senderID string, since time.Time) (*waitingOrder, error) {
+	var w waitingOrder
+	var orderJSON string
+	err := s.db.QueryRowContext(ctx, `SELECT order_id, order_json FROM confirmations
+		WHERE chat_id = ? AND sender_id = ? AND state = 'waiting' AND sent_at >= ?
+		ORDER BY sent_at DESC LIMIT 1`, chatID, senderID, since.UnixMilli()).Scan(&w.ID, &orderJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(orderJSON), &w.Order); err != nil {
+		return nil, err
+	}
+	return &w, nil
+}
+
+// CloseConfirmation records the customer's answer: confirmed, changed or cancelled.
+func (s *Store) CloseConfirmation(ctx context.Context, orderID, state string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE confirmations SET state = ? WHERE order_id = ?`, state, orderID)
 	return err
 }

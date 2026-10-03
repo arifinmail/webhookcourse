@@ -1,6 +1,6 @@
 // Command whatsapp-orders reads incoming WhatsApp messages, filters them, has Claude
-// turn customers' messages into orders, and posts each order to your system's webhook.
-// See README.md.
+// turn customers' messages into orders, posts each order to your system's webhook,
+// and can ask customers to confirm their order. See README.md.
 package main
 
 import (
@@ -34,7 +34,7 @@ func main() {
 
 	reader := NewExtractor(cfg)
 	if *try != "" {
-		if err := tryOrder(ctx, reader, *try); err != nil {
+		if err := tryOrder(ctx, cfg, reader, *try); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -52,7 +52,8 @@ func main() {
 	deliverer := NewDeliverer(cfg.Output, store, filepath.Join(cfg.DataDir, "orders.jsonl"))
 	go deliverer.Run(ctx)
 
-	pipeline := NewPipeline(ctx, cfg, store, reader, deliverer, *verbose)
+	replier := NewReplier(cfg.Reply, store)
+	pipeline := NewPipeline(ctx, cfg, store, reader, deliverer, replier, *verbose)
 	if err := pipeline.Resume(); err != nil {
 		log.Fatal(err)
 	}
@@ -61,12 +62,19 @@ func main() {
 		log.Fatal(err)
 	}
 	defer wa.Disconnect()
+	go replier.Run(ctx, wa.Send)
 
 	if cfg.Output.WebhookURL == "" {
 		log.Printf("Test mode: orders are only written to %s. Set output.webhook_url to send them to your system.",
 			filepath.Join(cfg.DataDir, "orders.jsonl"))
 	} else {
 		log.Printf("Orders go to %s.", cfg.Output.WebhookURL)
+	}
+	switch cfg.Reply.Mode {
+	case "preview":
+		log.Println("Confirmation messages are only shown in this log (reply.mode is preview).")
+	case "send":
+		log.Println("Customers who order in a private chat get a confirmation message.")
 	}
 	log.Println("Running. Press Ctrl+C to stop.")
 	select {
@@ -76,8 +84,8 @@ func main() {
 }
 
 // tryOrder reads text typed on the command line as if a customer had sent it, so you
-// can check your product list and API key before linking WhatsApp.
-func tryOrder(ctx context.Context, reader *Extractor, text string) error {
+// can check your product list, confirmation message and API key before linking WhatsApp.
+func tryOrder(ctx context.Context, cfg Config, reader *Extractor, text string) error {
 	now := time.Now()
 	var batch []Incoming
 	for i, line := range strings.Split(text, "\n") {
@@ -88,14 +96,17 @@ func tryOrder(ctx context.Context, reader *Extractor, text string) error {
 	if len(batch) == 0 {
 		return errors.New("-try needs some text")
 	}
-	order, model, err := reader.Extract(ctx, batch)
+	reading, err := reader.Extract(ctx, batch, nil)
 	if err != nil {
 		return err
 	}
-	out, err := json.MarshalIndent(order, "", "  ")
+	out, err := json.MarshalIndent(reading.Order, "", "  ")
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s\n(read by %s)\n", out, model)
+	fmt.Printf("%s\n(read by %s)\n", out, reading.Model)
+	if cfg.Reply.Mode != "off" && reading.Order.IsOrder && len(reading.Order.Items) > 0 {
+		fmt.Printf("\nThe confirmation message would be:\n%s\n", confirmText(cfg.Reply, reading.Order, "Test customer"))
+	}
 	return nil
 }

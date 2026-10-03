@@ -19,8 +19,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// WhatsApp links to your account as a linked device, like WhatsApp Web, and only
-// listens: nothing in this program sends messages, read receipts or "online" status.
+// WhatsApp links to your account as a linked device, like WhatsApp Web. It sends
+// nothing except the confirmation messages you turn on with reply.mode: no read
+// receipts, no "online" status.
 type WhatsApp struct {
 	client     *whatsmeow.Client
 	handle     func(Incoming)
@@ -101,6 +102,16 @@ func (wa *WhatsApp) link(ctx context.Context, pairPhone string) error {
 }
 
 func (wa *WhatsApp) Disconnect() { wa.client.Disconnect() }
+
+// Send sends a text message to a chat. Only the Replier uses it.
+func (wa *WhatsApp) Send(ctx context.Context, chatID, text string) error {
+	to, err := types.ParseJID(chatID)
+	if err != nil {
+		return err
+	}
+	_, err = wa.client.SendMessage(ctx, to, &waE2E.Message{Conversation: proto.String(text)})
+	return err
+}
 
 // LoggedOut is closed when the phone removes this linked device.
 func (wa *WhatsApp) LoggedOut() <-chan struct{} { return wa.loggedOut }

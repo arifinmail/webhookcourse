@@ -75,6 +75,23 @@ func TestAllow(t *testing.T) {
 	}
 }
 
+func TestOnlyNumbers(t *testing.T) {
+	now := time.Now()
+	f := FilterConfig{PrivateChats: true, OnlyNumbers: []string{"0812-1111-1111"}, MinLength: 1}
+	m := Incoming{SenderPhone: "6281211111111", Time: now, Text: "pesan 2"}
+	if ok, reason := f.Allow(m, now); !ok {
+		t.Errorf("listed number skipped: %s", reason)
+	}
+	m.SenderPhone = "6289999999999"
+	if ok, _ := f.Allow(m, now); ok {
+		t.Error("number not on the list was allowed")
+	}
+	m.SenderPhone = "" // WhatsApp hid the number
+	if ok, _ := f.Allow(m, now); ok {
+		t.Error("unknown number was allowed")
+	}
+}
+
 func TestWorthSending(t *testing.T) {
 	batch := []Incoming{{Text: "Halo kak"}, {Text: "Mau PESAN 2 ya"}}
 	if !(FilterConfig{}).WorthSending(batch) {

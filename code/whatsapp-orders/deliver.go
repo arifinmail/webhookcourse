@@ -16,13 +16,18 @@ import (
 	"time"
 )
 
-// OrderEvent is the JSON body your system receives for every order.
+// OrderEvent is the JSON body your system receives. Type is "order.created" for a new
+// order, and "order.confirmed" or "order.cancelled" when a customer answers the
+// confirmation message about an order.
 type OrderEvent struct {
 	ID        string          `json:"id"`
+	Type      string          `json:"type"`
+	OrderID   string          `json:"order_id"`
+	Replaces  string          `json:"replaces,omitempty"` // order.created: the order this one corrects
 	CreatedAt time.Time       `json:"created_at"`
 	Source    OrderSource     `json:"source"`
 	Messages  []SourceMessage `json:"messages"`
-	Order     Order           `json:"order"`
+	Order     *Order          `json:"order,omitempty"` // order.created only
 	Model     string          `json:"model"`
 }
 
@@ -40,9 +45,9 @@ type SourceMessage struct {
 	Text string    `json:"text"`
 }
 
-// Deliverer sends finished orders to your system as a webhook: an HTTP POST with the
-// order as JSON, signed with your secret. When your system doesn't answer with a 2xx
-// status, the order is retried with growing pauses, at most an hour apart.
+// Deliverer sends events to your system as a webhook: an HTTP POST with the event as
+// JSON, signed with your secret. When your system doesn't answer with a 2xx status,
+// the event is retried with growing pauses, at most an hour apart.
 type Deliverer struct {
 	url, secret string
 	store       *Store
@@ -64,7 +69,7 @@ func NewDeliverer(out OutputConfig, store *Store, logPath string) *Deliverer {
 	}
 }
 
-// Enqueue saves the order and sends it as soon as possible. Every order is also
+// Enqueue saves the event and sends it as soon as possible. Every event is also
 // appended to the local log file, one JSON object per line. Without a webhook URL
 // (test mode) the log file is the only place it goes.
 func (d *Deliverer) Enqueue(ctx context.Context, ev OrderEvent) error {
@@ -76,7 +81,7 @@ func (d *Deliverer) Enqueue(ctx context.Context, ev OrderEvent) error {
 		log.Printf("could not write %s: %v", d.logPath, err)
 	}
 	testMode := d.url == ""
-	if err := d.store.SaveOrder(ctx, ev.ID, body, testMode); err != nil {
+	if err := d.store.SaveEvent(ctx, ev.ID, body, testMode); err != nil {
 		return err
 	}
 	if !testMode {
@@ -88,7 +93,7 @@ func (d *Deliverer) Enqueue(ctx context.Context, ev OrderEvent) error {
 	return nil
 }
 
-// Run sends waiting orders until ctx is cancelled.
+// Run sends waiting events until ctx is cancelled.
 func (d *Deliverer) Run(ctx context.Context) {
 	if d.url == "" {
 		return
@@ -107,26 +112,26 @@ func (d *Deliverer) Run(ctx context.Context) {
 }
 
 func (d *Deliverer) deliverDue(ctx context.Context, now time.Time) {
-	orders, err := d.store.DueOrders(ctx, now)
+	events, err := d.store.DueEvents(ctx, now)
 	if err != nil {
-		log.Printf("could not load orders to send: %v", err)
+		log.Printf("could not load events to send: %v", err)
 		return
 	}
-	for _, o := range orders {
-		if err := d.post(ctx, o.ID, o.Payload); err != nil {
-			attempts := o.Attempts + 1
+	for _, e := range events {
+		if err := d.post(ctx, e.ID, e.Payload); err != nil {
+			attempts := e.Attempts + 1
 			retryIn := min(time.Minute<<min(attempts-1, 6), time.Hour)
-			log.Printf("could not send order %s to your system, trying again in %s: %v", o.ID, retryIn, err)
-			if err := d.store.MarkAttemptFailed(ctx, o.ID, attempts, now.Add(retryIn), err.Error()); err != nil {
-				log.Printf("could not save the retry for order %s: %v", o.ID, err)
+			log.Printf("could not send %s to your system, trying again in %s: %v", e.ID, retryIn, err)
+			if err := d.store.MarkAttemptFailed(ctx, e.ID, attempts, now.Add(retryIn), err.Error()); err != nil {
+				log.Printf("could not save the retry for %s: %v", e.ID, err)
 			}
 			continue
 		}
-		if err := d.store.MarkDelivered(ctx, o.ID); err != nil {
-			log.Printf("could not mark order %s as sent: %v", o.ID, err)
+		if err := d.store.MarkDelivered(ctx, e.ID); err != nil {
+			log.Printf("could not mark %s as sent: %v", e.ID, err)
 			continue
 		}
-		log.Printf("sent order %s to your system", o.ID)
+		log.Printf("sent %s to your system", e.ID)
 	}
 }
 
@@ -137,7 +142,7 @@ func (d *Deliverer) post(ctx context.Context, id string, body []byte) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "whatsapp-orders")
-	req.Header.Set("X-Order-Id", id)
+	req.Header.Set("X-Event-Id", id)
 	req.Header.Set("X-Signature-256", "sha256="+sign(d.secret, body))
 	resp, err := d.client.Do(req)
 	if err != nil {

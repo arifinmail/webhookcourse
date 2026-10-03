@@ -24,6 +24,12 @@ filter:
   ignore_numbers:
     - "+62 812-0000-0000"
 
+  # Optional: read only the messages from these numbers, for example your regular
+  # customers or resellers. Leave the list empty to read everyone.
+  only_numbers: []
+  # only_numbers:
+  #   - "+62 812-3456-7890"
+
   # Optional: only send a customer's messages to the AI when one of them contains
   # one of these words. Leave the list empty to let the AI judge every message
   # that passes the rest of the filter.
@@ -58,6 +64,34 @@ output:
   # Shared secret for the X-Signature-256 header. Better: leave this empty and
   # set the ORDER_WEBHOOK_SECRET environment variable instead.
   secret: ""
+
+reply:
+  # Confirmation messages for customers who order in a private chat (never in groups).
+  #   off:     don't reply
+  #   preview: only show in the log what would be sent; start here
+  #   send:    really send them
+  mode: preview
+
+  # The message. {name}, {items}, {missing}, {summary}, {address} and {time} are
+  # filled in from the order.
+  confirm: |
+    Halo {name}, pesanan kamu kami catat:
+    {items}
+    {missing}
+    Balas YA kalau sudah benar, atau tulis yang perlu diubah.
+
+  # Put in place of {missing} when something is still missing from the order.
+  missing: "Mohon info juga: {list}"
+
+  # Sent after the customer confirms. Leave it empty to send nothing.
+  thanks: "Terima kasih {name}, pesanan kamu kami proses 🙏"
+
+  # Send slowly, so WhatsApp doesn't take your number for a spammer.
+  min_gap: 20s
+  max_per_hour: 20
+
+  # How long a customer's answer still counts as an answer to the confirmation.
+  confirm_window: 24h
 
 # Where your WhatsApp login, messages and orders are kept. Keep this folder private.
 data_dir: store

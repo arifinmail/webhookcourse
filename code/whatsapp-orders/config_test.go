@@ -47,6 +47,9 @@ func TestLoadConfigRejectsMistakes(t *testing.T) {
 		"effort":         "claude:\n  effort: extreme\n",
 		"max_wait":       "batching:\n  quiet_period: 5m\n  max_wait: 1m\n",
 		"output.secret":  "output:\n  webhook_url: https://example.com/orders\n",
+		"reply.mode":     "reply:\n  mode: auto\n",
+		"reply.confirm":  "reply:\n  mode: send\n",
+		"reply.min_gap":  "reply:\n  mode: send\n  confirm: hi\n  min_gap: 1s\n",
 		"copy config.ex": "", // missing file, see below
 	}
 	for want, yaml := range cases {
@@ -76,7 +79,8 @@ func TestExampleConfigLoads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Products) == 0 || len(cfg.Filter.SkipPhrases) == 0 || cfg.Batching.QuietPeriod != 2*time.Minute {
+	if len(cfg.Products) == 0 || len(cfg.Filter.SkipPhrases) == 0 || cfg.Batching.QuietPeriod != 2*time.Minute ||
+		cfg.Reply.Mode != "preview" || !strings.Contains(cfg.Reply.Confirm, "{items}") || cfg.Reply.MaxPerHour != 20 {
 		t.Errorf("example config not read as expected: %+v", cfg)
 	}
 }

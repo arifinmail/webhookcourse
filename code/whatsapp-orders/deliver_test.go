@@ -31,8 +31,8 @@ func TestDelivererSignsAndRetries(t *testing.T) {
 		if got, want := r.Header.Get("X-Signature-256"), "sha256="+sign(secret, body); got != want {
 			t.Errorf("signature = %q, want %q", got, want)
 		}
-		if r.Header.Get("X-Order-Id") != "ord_1" {
-			t.Errorf("X-Order-Id = %q", r.Header.Get("X-Order-Id"))
+		if r.Header.Get("X-Event-Id") != "ord_1" {
+			t.Errorf("X-Event-Id = %q", r.Header.Get("X-Event-Id"))
 		}
 		if calls.Add(1) == 1 {
 			http.Error(w, "down for maintenance", http.StatusServiceUnavailable)
@@ -44,7 +44,7 @@ func TestDelivererSignsAndRetries(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "orders.jsonl")
 	d := NewDeliverer(OutputConfig{WebhookURL: srv.URL, Secret: secret}, store, logPath)
 	ctx := context.Background()
-	if err := d.Enqueue(ctx, OrderEvent{ID: "ord_1", Order: Order{IsOrder: true, Summary: "2 dimsum"}}); err != nil {
+	if err := d.Enqueue(ctx, OrderEvent{ID: "ord_1", Type: "order.created", OrderID: "ord_1", Order: &Order{IsOrder: true, Summary: "2 dimsum"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -58,7 +58,7 @@ func TestDelivererSignsAndRetries(t *testing.T) {
 	if calls.Load() != 2 {
 		t.Fatalf("calls = %d, want 2", calls.Load())
 	}
-	if due, _ := store.DueOrders(ctx, now.Add(24*time.Hour)); len(due) != 0 {
+	if due, _ := store.DueEvents(ctx, now.Add(24*time.Hour)); len(due) != 0 {
 		t.Errorf("order still waiting after it was delivered")
 	}
 	logged, _ := os.ReadFile(logPath)
@@ -75,7 +75,7 @@ func TestDelivererTestModeOnlyLogs(t *testing.T) {
 	if err := d.Enqueue(ctx, OrderEvent{ID: "ord_1"}); err != nil {
 		t.Fatal(err)
 	}
-	if due, _ := store.DueOrders(ctx, time.Now()); len(due) != 0 {
+	if due, _ := store.DueEvents(ctx, time.Now()); len(due) != 0 {
 		t.Error("test mode should not queue orders for sending")
 	}
 	if logged, _ := os.ReadFile(logPath); !strings.Contains(string(logged), `"id":"ord_1"`) {

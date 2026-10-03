@@ -2,25 +2,29 @@
 
 Reads the WhatsApp messages your customers send you, in private chats and in the
 groups you choose. Claude turns them into orders, and each order goes to your own
-system as a webhook.
+system as a webhook. Customers who order in a private chat can get a message asking
+them to confirm, and their answer goes to your system too.
 
 ```
 WhatsApp ─► filter ─► wait until the ─► Claude fills in ─► POST to your system
 (linked     (your     customer stops    the order          (signed JSON,
- device)     rules)    typing)                               retried if it's down)
+ device)     rules)    typing)              │                retried if it's down)
+                                            └─► "Please confirm" message (optional)
 ```
 
 ## Good to know first
 
 - It links to your WhatsApp as a linked device, like WhatsApp Web, using
   [whatsmeow](https://github.com/tulir/whatsmeow), an unofficial library. WhatsApp
-  doesn't allow unofficial apps, so there is a risk of your number being banned. To
-  keep that risk low, this program never sends anything: no messages, no read
-  receipts, no "online" status.
+  doesn't allow unofficial apps, so there is a risk of your number being banned.
+  Automatic sending raises that risk most, so the program only sends the
+  confirmation messages you turn on, only in private chats, only to people who just
+  ordered, and slowly. It never sends read receipts or "online" status.
 - Only messages that pass your filter go to Claude. Everything else stays on your computer.
 - Claude only fills in an order form. It can't send messages or see other chats, and
   it ignores instructions written inside messages, so a trick message can at worst
-  produce a wrong order.
+  produce a wrong order. Confirmation messages are your own text with the order
+  filled in.
 - It has to keep running to see new messages: use a computer that stays on, or a small
   server. Messages that arrive while it's off are picked up when it starts again
   (up to `filter.max_age` old). When Claude can't be reached (no internet, a wrong API
@@ -37,9 +41,9 @@ WhatsApp ─► filter ─► wait until the ─► Claude fills in ─► POST 
    - macOS / Linux: `export ANTHROPIC_API_KEY=sk-ant-...`
    - Windows (PowerShell): `$env:ANTHROPIC_API_KEY="sk-ant-..."`
 3. In this folder, copy `config.example.yaml` to `config.yaml` and fill in your
-   products, groups and filter.
+   products, groups, filter and confirmation message.
 4. Check that Claude reads your orders correctly before connecting WhatsApp. Each line
-   is one message:
+   is one message, and you also see the confirmation message the customer would get:
    ```
    go run . -try "Kak mau pesan 2 dimsum ayam ya, kirim ke Jl. Melati 5 besok sore"
    ```
@@ -57,13 +61,46 @@ While `output.webhook_url` is empty the program runs in test mode: orders only g
 connecting your system. Orders made in test mode are not sent later. Add `-v` to see why
 messages are skipped (their text is never logged).
 
+## Confirmation messages
+
+With `reply.mode: send`, a customer who orders in a private chat gets your
+`reply.confirm` message with their order filled in, for example:
+
+```
+Halo Budi, pesanan kamu kami catat:
+- 2 Dimsum ayam (isi 10)
+Mohon info juga: alamat pengiriman
+Balas YA kalau sudah benar, atau tulis yang perlu diubah.
+```
+
+Claude then reads their answer together with that order:
+
+- **They agree** ("ya", "ok", "betul"): your system gets `order.confirmed`, and the
+  customer gets `reply.thanks` if you wrote one. Short answers like "ok" count here
+  even though `skip_phrases` would normally drop them.
+- **They change something** ("jadi 3 ya"): your system gets a new `order.created`
+  with `replaces` set to the old order, and the customer gets a new confirmation.
+- **They cancel** ("batal"): your system gets `order.cancelled`.
+- **Something else**: read as a normal message.
+
+Start with `reply.mode: preview`. The program then only writes in its log what it
+would send, so you can check the messages before any customer sees them. Switch to
+`send` when you're happy with them.
+
+To keep the ban risk down, messages go out at least `reply.min_gap` apart and at most
+`reply.max_per_hour` per hour; the rest wait their turn. Nothing is ever sent in
+groups: an automatic message there is seen by everyone, and anyone in the group could
+make it repeat their text.
+
 ## Receiving orders in your system
 
-Every order is sent as a `POST` to `output.webhook_url`:
+Every event is sent as a `POST` to `output.webhook_url`. A new order:
 
 ```json
 {
   "id": "ord_20261003T071502_9a353a9e",
+  "type": "order.created",
+  "order_id": "ord_20261003T071502_9a353a9e",
   "created_at": "2026-10-03T07:15:02Z",
   "source": {
     "chat_type": "group",
@@ -92,15 +129,33 @@ Every order is sent as a `POST` to `output.webhook_url`:
 }
 ```
 
+A customer's answer to a confirmation message has no `order`; `order_id` says which
+order it's about, and `messages` holds the answer:
+
+```json
+{
+  "id": "evt_20261003T072210_51c0e2aa",
+  "type": "order.confirmed",
+  "order_id": "ord_20261003T071502_9a353a9e",
+  "created_at": "2026-10-03T07:22:10Z",
+  "source": { "chat_type": "private", "chat_id": "6281234567890@s.whatsapp.net", "sender_phone": "6281234567890", "sender_name": "Budi" },
+  "messages": [{ "id": "3EB0B7", "time": "2026-10-03T07:22:01Z", "text": "ya betul" }],
+  "model": "claude-opus-5-5"
+}
+```
+
+- `type` is `order.created`, `order.confirmed` or `order.cancelled`. A corrected order
+  is an `order.created` with `replaces` set to the order it corrects.
 - `X-Signature-256: sha256=<hex>` is the HMAC-SHA256 of the raw body with your
   secret. Reject requests where it doesn't match.
-- Answer with any 2xx status once the order is saved. Otherwise it's sent again after
+- Answer with any 2xx status once the event is saved. Otherwise it's sent again after
   1, 2, 4, ... minutes, then every hour, until your system accepts it.
-- The same order can arrive twice (for example when your system saved it but answered
-  too slowly). `id` is also in the `X-Order-Id` header: skip ids you already have.
+- The same event can arrive twice (for example when your system saved it but answered
+  too slowly). `id` is also in the `X-Event-Id` header: skip ids you already have.
 - `needs_review: true` means something was unclear; `missing_info` says what to ask.
-- A customer who adds to an order after `quiet_period` sends a second order. Use
-  `source.sender_phone` and `source.chat_id` to put them together.
+- Without confirmation messages, a customer who adds to an order after
+  `quiet_period` sends a second order. Use `source.sender_phone` and
+  `source.chat_id` to put them together.
 
 A receiver in Node.js with Express, like `code/express-discorder`:
 
@@ -121,8 +176,19 @@ app.post("/orders", express.raw({ type: "application/json" }), (req, res) => {
     return res.status(401).send("Bad signature");
   }
   const event = JSON.parse(req.body);
-  // Save event.order in your system here, and skip event.id if you already have it.
-  console.log(`Order ${event.id} from ${event.source.sender_name}: ${event.order.summary}`);
+  // Skip event.id if you already have it, then save the change in your system.
+  switch (event.type) {
+    case "order.created":
+      console.log(`New order ${event.order_id} from ${event.source.sender_name}: ${event.order.summary}`);
+      if (event.replaces) console.log(`  it replaces ${event.replaces}`);
+      break;
+    case "order.confirmed":
+      console.log(`Order ${event.order_id} confirmed`);
+      break;
+    case "order.cancelled":
+      console.log(`Order ${event.order_id} cancelled`);
+      break;
+  }
   res.sendStatus(200);
 });
 
@@ -134,12 +200,15 @@ Use the same secret on both sides: `ORDER_WEBHOOK_SECRET` here, and `output.secr
 
 ## What reaches Claude
 
-- Never: your own messages, chats from `ignore_numbers`, groups not in `groups`,
-  status updates and channels.
+- Never: your own messages, chats from `ignore_numbers` (or not in `only_numbers`,
+  when you fill that in), groups not in `groups`, status updates and channels.
+  WhatsApp sometimes hides people's numbers in groups; with `only_numbers` set, their
+  messages are skipped.
 - Only text: plain messages and the captions of photos, videos and documents.
   Stickers, voice notes and photos without a caption are skipped.
 - A customer's messages are collected until they have been quiet for `quiet_period`,
-  then read together as one order.
+  then read together as one order. When the customer was asked to confirm an order,
+  Claude also sees that order, to tell whether they confirm, change or cancel it.
 
 ## Cost
 
@@ -157,8 +226,9 @@ with `-try` on some real messages first.
 | `filter.go` | Your filter rules |
 | `batcher.go` | Waits until a customer stops typing |
 | `extract.go` | Asks Claude to fill in the order (structured output, so the answer always parses) |
-| `deliver.go` | Signs and sends orders, retries when your system is down |
-| `store.go` | SQLite file with messages and orders, so a restart loses nothing |
-| `pipeline.go` | Connects the steps |
+| `reply.go` | Confirmation messages: fills in your text, sends slowly |
+| `deliver.go` | Signs and sends events to your system, retries when it's down |
+| `store.go` | SQLite file with messages, events and confirmations, so a restart loses nothing |
+| `pipeline.go` | Connects the steps and handles customers' answers |
 
 Run the tests with `go test ./...`.

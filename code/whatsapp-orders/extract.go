@@ -32,6 +32,21 @@ type OrderItem struct {
 	Notes    string  `json:"notes"`
 }
 
+// Reading is the result of reading one batch of messages.
+type Reading struct {
+	Order Order
+	// How the messages relate to an order the customer was asked to confirm:
+	// confirms, changes, cancels or unrelated.
+	AboutPrevious string
+	Model         string
+}
+
+// answer is the JSON Claude returns.
+type answer struct {
+	Order
+	AboutPreviousOrder string `json:"about_previous_order"`
+}
+
 func stringField() map[string]any { return map[string]any{"type": "string"} }
 
 // orderSchema makes Claude's answer always parse into Order (structured outputs).
@@ -39,7 +54,7 @@ var orderSchema = map[string]any{
 	"type":                 "object",
 	"additionalProperties": false,
 	"required": []string{"is_order", "customer_name", "items", "delivery_address", "delivery_time",
-		"payment_method", "notes", "missing_info", "needs_review", "summary"},
+		"payment_method", "notes", "missing_info", "needs_review", "summary", "about_previous_order"},
 	"properties": map[string]any{
 		"is_order":      map[string]any{"type": "boolean"},
 		"customer_name": stringField(),
@@ -64,6 +79,10 @@ var orderSchema = map[string]any{
 		"missing_info":     map[string]any{"type": "array", "items": stringField()},
 		"needs_review":     map[string]any{"type": "boolean"},
 		"summary":          stringField(),
+		"about_previous_order": map[string]any{
+			"type": "string",
+			"enum": []string{"confirms", "changes", "cancels", "unrelated"},
+		},
 	},
 }
 
@@ -98,8 +117,9 @@ func NewExtractor(cfg Config, opts ...option.RequestOption) *Extractor {
 	}
 }
 
-// Extract returns the order and the model that read it.
-func (e *Extractor) Extract(ctx context.Context, batch []Incoming) (Order, string, error) {
+// Extract reads one customer's batch of messages. previous is the order this customer
+// was asked to confirm, or nil.
+func (e *Extractor) Extract(ctx context.Context, batch []Incoming, previous *Order) (Reading, error) {
 	params := anthropic.BetaMessageNewParams{
 		Model:     e.model,
 		MaxTokens: 16000,
@@ -108,7 +128,7 @@ func (e *Extractor) Extract(ctx context.Context, batch []Incoming) (Order, strin
 			CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
 		}},
 		Messages: []anthropic.BetaMessageParam{
-			anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(conversationPrompt(batch))),
+			anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(conversationPrompt(batch, previous))),
 		},
 		OutputConfig: anthropic.BetaOutputConfigParam{
 			Effort: e.effort, // left out of the request when empty
@@ -123,16 +143,15 @@ func (e *Extractor) Extract(ctx context.Context, batch []Incoming) (Order, strin
 	if err != nil {
 		var apiErr *anthropic.Error
 		if errors.As(err, &apiErr) && (apiErr.StatusCode == 401 || apiErr.StatusCode == 403) {
-			return Order{}, "", fmt.Errorf("the Claude API did not accept your key, check ANTHROPIC_API_KEY: %w", err)
+			return Reading{}, fmt.Errorf("the Claude API did not accept your key, check ANTHROPIC_API_KEY: %w", err)
 		}
-		return Order{}, "", err
+		return Reading{}, err
 	}
-	model := string(resp.Model)
 	switch resp.StopReason {
 	case anthropic.BetaStopReasonRefusal:
-		return Order{}, model, badAnswer{fmt.Errorf("Claude declined to read these messages (%s)", resp.StopDetails.Category)}
+		return Reading{}, badAnswer{fmt.Errorf("Claude declined to read these messages (%s)", resp.StopDetails.Category)}
 	case anthropic.BetaStopReasonMaxTokens:
-		return Order{}, model, badAnswer{errors.New("Claude's answer was cut off before it finished")}
+		return Reading{}, badAnswer{errors.New("Claude's answer was cut off before it finished")}
 	}
 
 	var text strings.Builder
@@ -141,11 +160,14 @@ func (e *Extractor) Extract(ctx context.Context, batch []Incoming) (Order, strin
 			text.WriteString(b.Text)
 		}
 	}
-	var order Order
-	if err := json.Unmarshal([]byte(text.String()), &order); err != nil {
-		return Order{}, model, badAnswer{fmt.Errorf("Claude's answer was not an order: %w", err)}
+	var a answer
+	if err := json.Unmarshal([]byte(text.String()), &a); err != nil {
+		return Reading{}, badAnswer{fmt.Errorf("Claude's answer was not an order: %w", err)}
 	}
-	return order, model, nil
+	if previous == nil {
+		a.AboutPreviousOrder = "unrelated"
+	}
+	return Reading{Order: a.Order, AboutPrevious: a.AboutPreviousOrder, Model: string(resp.Model)}, nil
 }
 
 func systemPrompt(cfg Config) string {
@@ -173,11 +195,12 @@ How to fill in the order:
 - missing_info lists what the business still has to ask to complete the order, in the customer's language.
 - needs_review is true when anything is unclear or doesn't match the product list.
 - summary is one short line describing the order, in the customer's language.
+- about_previous_order: a <previous_order> means the business sent the customer a summary of that order and asked them to confirm it. Use "confirms" when the new messages accept it as it is, "cancels" when the customer no longer wants it (for both, set is_order to false), "changes" when they want something different (then fill in the complete updated order and set is_order to true), and "unrelated" when the messages are about something else. Without a <previous_order>, use "unrelated".
 `)
 	return b.String()
 }
 
-func conversationPrompt(batch []Incoming) string {
+func conversationPrompt(batch []Incoming, previous *Order) string {
 	first := batch[0]
 	var b strings.Builder
 	if first.IsGroup {
@@ -188,6 +211,11 @@ func conversationPrompt(batch []Incoming) string {
 	fmt.Fprintf(&b, "WhatsApp name: %s\n", first.SenderName)
 	if first.SenderPhone != "" {
 		fmt.Fprintf(&b, "Phone: +%s\n", first.SenderPhone)
+	}
+	if previous != nil {
+		// json.Marshal escapes < and >, so the order can't end the block early.
+		prev, _ := json.Marshal(previous)
+		fmt.Fprintf(&b, "\nThe business sent this customer a summary of this order and asked them to confirm it:\n<previous_order>\n%s\n</previous_order>\n", prev)
 	}
 	b.WriteString("\nMessages from this customer, oldest first:\n<messages>\n")
 	for _, m := range batch {

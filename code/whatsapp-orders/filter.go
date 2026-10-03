@@ -25,9 +25,16 @@ func (m Incoming) Key() string { return m.ChatID + "|" + m.SenderID }
 // Allow decides whether a single message may be sent to the AI at all.
 // When it says no, it also says why (without repeating the message text).
 func (f FilterConfig) Allow(m Incoming, now time.Time) (bool, string) {
-	text := strings.TrimSpace(m.Text)
+	if ok, reason := f.AllowSender(m, now); !ok {
+		return false, reason
+	}
+	return f.AllowText(m.Text)
+}
+
+// AllowSender applies the rules about who wrote the message, where and when.
+func (f FilterConfig) AllowSender(m Incoming, now time.Time) (bool, string) {
 	switch {
-	case text == "":
+	case strings.TrimSpace(m.Text) == "":
 		return false, "no text (sticker, photo without caption, voice note, ...)"
 	case f.MaxAge > 0 && now.Sub(m.Time) > f.MaxAge:
 		return false, "older than filter.max_age"
@@ -35,8 +42,19 @@ func (f FilterConfig) Allow(m Incoming, now time.Time) (bool, string) {
 		return false, "group is not in filter.groups"
 	case !m.IsGroup && !f.PrivateChats:
 		return false, "filter.private_chats is off"
-	case f.ignoresNumber(m.SenderPhone):
+	case anyPhone(f.IgnoreNumbers, m.SenderPhone):
 		return false, "sender is in filter.ignore_numbers"
+	case len(f.OnlyNumbers) > 0 && !anyPhone(f.OnlyNumbers, m.SenderPhone):
+		return false, "sender is not in filter.only_numbers"
+	}
+	return true, ""
+}
+
+// AllowText applies the rules about the text itself. The pipeline lets customers who
+// were just asked to confirm an order skip these, since their answer is often "ok".
+func (f FilterConfig) AllowText(text string) (bool, string) {
+	text = strings.TrimSpace(text)
+	switch {
 	case len([]rune(text)) < f.MinLength:
 		return false, "shorter than filter.min_length"
 	case f.isSkipPhrase(text):
@@ -72,8 +90,8 @@ func (f FilterConfig) watchesGroup(id, name string) bool {
 	return false
 }
 
-func (f FilterConfig) ignoresNumber(phone string) bool {
-	for _, n := range f.IgnoreNumbers {
+func anyPhone(numbers []string, phone string) bool {
+	for _, n := range numbers {
 		if samePhone(n, phone) {
 			return true
 		}
