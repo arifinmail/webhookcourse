@@ -1,0 +1,63 @@
+# Copy this file to config.yaml and change it to fit your shop.
+# Lines starting with # are comments.
+
+# Tell Claude about your business: what you sell, delivery, anything that helps it read orders.
+business_info: |
+  Home-made frozen food. Delivery in Jakarta, or pick-up in Kemang.
+  Customers usually order in Indonesian.
+
+# Your products. Claude uses these names in the orders it sends to your system.
+products:
+  - Dimsum ayam (isi 10) - Rp 35.000
+  - Risoles mayo (isi 6) - Rp 30.000
+  - Sambal bawang (botol 150 g) - Rp 25.000
+
+filter:
+  # Read one-on-one chats? Your own messages are never read.
+  private_chats: true
+
+  # Groups to read, by their exact name. Groups not listed here are never read.
+  groups:
+    - PO Frozen Food Oktober
+
+  # Messages from these numbers never go to the AI: family, friends, suppliers...
+  ignore_numbers:
+    - "+62 812-0000-0000"
+
+  # Optional: only send a customer's messages to the AI when one of them contains
+  # one of these words. Leave the list empty to let the AI judge every message
+  # that passes the rest of the filter.
+  keywords: []
+  # keywords: [pesan, order, beli, po, mau]
+
+  # Messages that are only one of these are ignored.
+  skip_phrases: [ok, oke, okay, sip, siap, makasih, terima kasih, thanks, thank you, "👍", "🙏"]
+
+  # Ignore messages shorter than this many characters.
+  min_length: 2
+
+  # Ignore messages older than this, for example ones that arrive after the
+  # computer was off for a long time.
+  max_age: 24h
+
+batching:
+  # A customer's messages are read together once they have been quiet this long.
+  quiet_period: 2m
+  # ...but never wait longer than this.
+  max_wait: 15m
+
+claude:
+  model: claude-opus-5-5
+  # How carefully Claude reads: low, medium or high. Lower is cheaper.
+  effort: medium
+
+output:
+  # Your system's webhook address. Every order is sent there as a JSON POST.
+  # Leave it empty to try things out: orders then only go to store/orders.jsonl.
+  webhook_url: ""
+  # Shared secret for the X-Signature-256 header. Better: leave this empty and
+  # set the ORDER_WEBHOOK_SECRET environment variable instead.
+  secret: ""
+
+# Where your WhatsApp login, messages and orders are kept. Keep this folder private.
+data_dir: store

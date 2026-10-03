@@ -1,0 +1,9 @@
+# Your settings and secrets
+config.yaml
+
+# Your WhatsApp login, messages and orders
+store/
+
+# Built program
+whatsapp-orders
+whatsapp-orders.exe
